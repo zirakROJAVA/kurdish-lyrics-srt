@@ -3,20 +3,20 @@ import streamlit as st
 from groq import Groq
 
 
-# ============================================================
+# =========================================================
 # PAGE CONFIG
-# ============================================================
+# =========================================================
 
 st.set_page_config(
     page_title="Kurdish Lyrics → English SRT",
     page_icon="🎵",
-    layout="centered",
+    layout="centered"
 )
 
 
-# ============================================================
-# UI
-# ============================================================
+# =========================================================
+# TITLE
+# =========================================================
 
 st.title("🎵 Kurdish Lyrics → English SRT")
 
@@ -26,132 +26,131 @@ st.caption(
 )
 
 
-# ============================================================
+# =========================================================
 # HELPERS
-# ============================================================
-
-def srt_time(seconds: float) -> str:
-    """Convert seconds to SRT timestamp."""
-
-    seconds = max(0.0, float(seconds))
-
-    total = int(seconds)
-    ms = int(round((seconds - total) * 1000))
-
-    if ms >= 1000:
-        total += 1
-        ms = 0
-
-    hours = total // 3600
-    minutes = (total % 3600) // 60
-    secs = total % 60
-
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{ms:03d}"
-
+# =========================================================
 
 def clean_text(text: str) -> str:
-    """Clean unnecessary whitespace."""
+    text = text or ""
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
-    text = re.sub(r"\s+", " ", text or "").strip()
 
-    return text
+def srt_time(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+
+    total_ms = int(round(seconds * 1000))
+
+    hours = total_ms // 3_600_000
+    total_ms %= 3_600_000
+
+    minutes = total_ms // 60_000
+    total_ms %= 60_000
+
+    secs = total_ms // 1_000
+    milliseconds = total_ms % 1_000
+
+    return (
+        f"{hours:02d}:"
+        f"{minutes:02d}:"
+        f"{secs:02d},"
+        f"{milliseconds:03d}"
+    )
 
 
 def make_srt(items):
-    """Create an SRT file from timed subtitle items."""
-
     blocks = []
-
-    subtitle_number = 1
+    number = 1
 
     for item in items:
 
-        start = item["start"]
-        end = item["end"]
-        text = clean_text(item["text"])
+        text = clean_text(item.get("text", ""))
 
         if not text:
             continue
 
+        start = float(item.get("start", 0))
+        end = float(item.get("end", 0))
+
+        if end <= start:
+            end = start + 1
+
         blocks.append(
-            f"{subtitle_number}\n"
+            f"{number}\n"
             f"{srt_time(start)} --> {srt_time(end)}\n"
             f"{text}\n"
         )
 
-        subtitle_number += 1
+        number += 1
 
     return "\n".join(blocks)
 
 
-# ============================================================
+# =========================================================
 # GROQ TRANSCRIPTION
-# ============================================================
+# =========================================================
 
 def groq_transcribe(client, audio_bytes, filename):
-    """
-    Transcribe Kurdish audio using Groq Whisper
-    and return timestamped segments.
-    """
 
     result = client.audio.transcriptions.create(
+
         file=(filename, audio_bytes),
 
         model="whisper-large-v3",
+
+        # IMPORTANT:
+        # Do NOT use language="ku".
+        # Groq currently does not accept "ku" as a language parameter.
+
+        prompt=(
+            "The audio contains Kurdish Sorani lyrics. "
+            "Transcribe the Kurdish Sorani speech/song as accurately "
+            "as possible. Preserve Kurdish words, names and pronunciation. "
+            "Do not translate the lyrics. "
+            "Use Kurdish Sorani script when possible."
+        ),
 
         response_format="verbose_json",
 
         timestamp_granularities=["segment"],
 
-        language="ku",
-
-        temperature=0,
+        temperature=0
     )
 
     segments = []
 
-    # --------------------------------------------------------
-    # SDK object response
-    # --------------------------------------------------------
+    raw_segments = getattr(result, "segments", None)
 
-    for seg in getattr(result, "segments", []) or []:
+    if raw_segments:
 
-        text = clean_text(
-            getattr(seg, "text", "")
-        )
+        for seg in raw_segments:
 
-        if text:
-
-            segments.append(
-                {
-                    "start": float(
-                        getattr(seg, "start", 0)
-                    ),
-
-                    "end": float(
-                        getattr(seg, "end", 0)
-                    ),
-
-                    "ku": text,
-                }
+            text = clean_text(
+                getattr(seg, "text", "")
             )
 
-    # --------------------------------------------------------
-    # Dictionary response fallback
-    # --------------------------------------------------------
+            if not text:
+                continue
+
+            segments.append({
+                "start": float(
+                    getattr(seg, "start", 0)
+                ),
+                "end": float(
+                    getattr(seg, "end", 0)
+                ),
+                "ku": text
+            })
+
+    # Fallback for dictionary-style responses
 
     if not segments:
 
         if hasattr(result, "model_dump"):
-
             raw = result.model_dump()
-
         elif isinstance(result, dict):
-
             raw = result
-
         else:
-
             raw = {}
 
         for seg in raw.get("segments", []):
@@ -160,79 +159,82 @@ def groq_transcribe(client, audio_bytes, filename):
                 seg.get("text", "")
             )
 
-            if text:
+            if not text:
+                continue
 
-                segments.append(
-                    {
-                        "start": float(
-                            seg.get("start", 0)
-                        ),
-
-                        "end": float(
-                            seg.get("end", 0)
-                        ),
-
-                        "ku": text,
-                    }
-                )
+            segments.append({
+                "start": float(
+                    seg.get("start", 0)
+                ),
+                "end": float(
+                    seg.get("end", 0)
+                ),
+                "ku": text
+            })
 
     return segments
 
 
-# ============================================================
+# =========================================================
 # TRANSLATION
-# ============================================================
+# =========================================================
 
 def translate_batch(client, texts):
-    """
-    Translate Kurdish Sorani lyrics into English.
 
-    One input line = exactly one output line.
-    """
+    if not texts:
+        return []
 
     prompt = """
-Translate each Kurdish Sorani lyric line into natural English.
+Translate the following Kurdish Sorani song lyrics into natural English.
 
 IMPORTANT RULES:
 
-- Return EXACTLY one English line for each numbered input.
-- Keep the numbering.
-- Do NOT explain anything.
-- Do NOT add explanations.
-- Do NOT merge lines.
-- Do NOT split lines.
-- Preserve names.
-- Preserve the poetic meaning as naturally as possible.
-- Do not add quotation marks.
-- Output ONLY the numbered translations.
+1. Return EXACTLY one English line for each numbered Kurdish line.
+2. Keep the same numbering.
+3. Do NOT merge lines.
+4. Do NOT split lines.
+5. Do NOT explain anything.
+6. Do NOT add notes.
+7. Preserve names and places.
+8. Preserve the poetic meaning as naturally as possible.
+9. Output ONLY the numbered English translations.
+
+Example:
 
 INPUT:
+1. سڵاو ئەی دڵدارەکەم
+2. تۆ هەموو ژیانی منیت
+
+OUTPUT:
+1. Hello, my beloved
+2. You are my entire life
+
+Now translate:
+
 """
 
     for i, text in enumerate(texts, 1):
-
         prompt += f"{i}. {text}\n"
 
     response = client.chat.completions.create(
 
         model="llama-3.3-70b-versatile",
 
-        temperature=0.15,
+        temperature=0.1,
 
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "You are a precise Kurdish Sorani "
-                    "to English lyric translator."
-                ),
+                    "You are an expert Kurdish Sorani "
+                    "to English literary translator."
+                )
             },
-
             {
                 "role": "user",
-                "content": prompt,
-            },
-        ],
+                "content": prompt
+            }
+        ]
     )
 
     content = (
@@ -242,36 +244,34 @@ INPUT:
         or ""
     )
 
-    result = {}
+    translations = {}
 
     for line in content.splitlines():
 
         match = re.match(
             r"^\s*(\d+)\s*[\.\):-]\s*(.+?)\s*$",
-            line,
+            line
         )
 
         if match:
 
-            number = int(
-                match.group(1)
-            )
+            number = int(match.group(1))
 
             translation = clean_text(
                 match.group(2)
             )
 
-            result[number] = translation
+            translations[number] = translation
 
     return [
-        result.get(i, "")
+        translations.get(i, "")
         for i in range(1, len(texts) + 1)
     ]
 
 
-# ============================================================
+# =========================================================
 # GET API KEY FROM STREAMLIT SECRETS
-# ============================================================
+# =========================================================
 
 try:
 
@@ -279,9 +279,7 @@ try:
 
 except Exception:
 
-    st.error(
-        "❌ GROQ_API_KEY is not configured."
-    )
+    st.error("❌ GROQ_API_KEY is not configured.")
 
     st.info(
         "Go to Streamlit → Manage app → Settings → Secrets "
@@ -291,81 +289,77 @@ except Exception:
     st.stop()
 
 
-# ============================================================
-# UPLOAD AUDIO
-# ============================================================
+# =========================================================
+# CREATE GROQ CLIENT
+# =========================================================
+
+client = Groq(
+    api_key=api_key
+)
+
+
+# =========================================================
+# UPLOAD
+# =========================================================
 
 st.markdown("### 📁 Upload the song")
 
 uploaded = st.file_uploader(
-
     "MP3 / M4A / WAV / FLAC / OGG",
-
     type=[
         "mp3",
         "m4a",
         "wav",
         "flac",
-        "ogg",
-    ],
+        "ogg"
+    ]
 )
 
 
-# ============================================================
+# =========================================================
 # PROCESS
-# ============================================================
+# =========================================================
 
 if uploaded:
 
     st.audio(uploaded)
 
+    file_size_mb = (
+        len(uploaded.getvalue())
+        / (1024 * 1024)
+    )
+
+    st.caption(
+        f"File size: {file_size_mb:.2f} MB"
+    )
+
+    if file_size_mb > 25:
+
+        st.error(
+            "❌ File is larger than 25 MB. "
+            "Please compress the audio first."
+        )
+
+        st.stop()
+
     if st.button(
-        "🚀 Generate English.srt",
+        "🚀 Generate English SRT",
         type="primary",
-        use_container_width=True,
+        use_container_width=True
     ):
 
         try:
 
-            # ------------------------------------------------
-            # Create Groq client
-            # ------------------------------------------------
-
-            client = Groq(
-                api_key=api_key
-            )
-
-            # ------------------------------------------------
-            # Read uploaded audio
-            # ------------------------------------------------
-
-            audio = uploaded.getvalue()
-
-            # ------------------------------------------------
-            # File size check
-            # ------------------------------------------------
-
-            if len(audio) > 24 * 1024 * 1024:
-
-                st.error(
-                    "❌ This file is larger than 24 MB. "
-                    "Please compress the audio and try again."
-                )
-
-                st.stop()
-
-            # ------------------------------------------------
-            # Processing status
-            # ------------------------------------------------
+            audio_bytes = uploaded.getvalue()
 
             with st.status(
                 "Processing song...",
-                expanded=True,
+                expanded=True
             ) as status:
 
-                # ============================================
+                # -----------------------------------------
                 # STEP 1
-                # ============================================
+                # -----------------------------------------
 
                 st.write(
                     "🎙️ Step 1/3 — "
@@ -374,24 +368,23 @@ if uploaded:
 
                 segments = groq_transcribe(
                     client,
-                    audio,
-                    uploaded.name,
+                    audio_bytes,
+                    uploaded.name
                 )
 
                 if not segments:
 
                     raise RuntimeError(
-                        "No timestamped segments were returned."
+                        "Groq did not return any timestamped segments."
                     )
 
                 st.write(
-                    f"✅ Found {len(segments)} "
-                    "timed lyric segments."
+                    f"✅ Found {len(segments)} lyric segments."
                 )
 
-                # ============================================
+                # -----------------------------------------
                 # STEP 2
-                # ============================================
+                # -----------------------------------------
 
                 st.write(
                     "🌍 Step 2/3 — "
@@ -400,12 +393,12 @@ if uploaded:
 
                 english = []
 
-                batch_size = 25
+                batch_size = 20
 
                 for start in range(
                     0,
                     len(segments),
-                    batch_size,
+                    batch_size
                 ):
 
                     batch = segments[
@@ -413,154 +406,128 @@ if uploaded:
                     ]
 
                     batch_texts = [
-                        item["ku"]
-                        for item in batch
+                        x["ku"]
+                        for x in batch
                     ]
 
                     translated = translate_batch(
                         client,
-                        batch_texts,
+                        batch_texts
                     )
 
                     english.extend(
                         translated
                     )
 
-                # ============================================
+                # -----------------------------------------
                 # STEP 3
-                # ============================================
+                # -----------------------------------------
 
                 st.write(
                     "📝 Step 3/3 — "
-                    "Building English.srt"
+                    "Building SRT files"
                 )
-
-                # ------------------------------------------------
-                # English subtitles
-                # ------------------------------------------------
 
                 english_items = []
 
-                for seg, en in zip(
-                    segments,
-                    english,
+                kurdish_items = []
+
+                for index, segment in enumerate(
+                    segments
                 ):
 
-                    english_items.append(
-                        {
-                            "start": seg["start"],
-                            "end": seg["end"],
+                    ku_text = segment["ku"]
 
-                            "text": (
-                                en
-                                if en
-                                else seg["ku"]
-                            ),
-                        }
-                    )
+                    en_text = ""
+
+                    if index < len(english):
+                        en_text = clean_text(
+                            english[index]
+                        )
+
+                    if not en_text:
+                        en_text = ku_text
+
+                    kurdish_items.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": ku_text
+                    })
+
+                    english_items.append({
+                        "start": segment["start"],
+                        "end": segment["end"],
+                        "text": en_text
+                    })
 
                 english_srt = make_srt(
                     english_items
                 )
 
-                # ------------------------------------------------
-                # Kurdish subtitles
-                # ------------------------------------------------
-
-                kurdish_items = []
-
-                for seg in segments:
-
-                    kurdish_items.append(
-                        {
-                            "start": seg["start"],
-                            "end": seg["end"],
-                            "text": seg["ku"],
-                        }
-                    )
-
                 kurdish_srt = make_srt(
                     kurdish_items
                 )
 
-                # ------------------------------------------------
-                # Finish
-                # ------------------------------------------------
-
                 status.update(
                     label="✅ Finished!",
-                    state="complete",
+                    state="complete"
                 )
 
-            # ====================================================
+            # =================================================
             # RESULTS
-            # ====================================================
+            # =================================================
 
             st.success(
-                "✅ English and Kurdish SRT files are ready!"
+                "🎉 SRT files are ready!"
             )
-
-            # ----------------------------------------------------
-            # Tabs
-            # ----------------------------------------------------
 
             tab1, tab2 = st.tabs(
                 [
                     "🇬🇧 English SRT",
-                    "🟡 Kurdish SRT",
+                    "🟡 Kurdish SRT"
                 ]
             )
 
-            # ====================================================
+            # -----------------------------------------
             # ENGLISH
-            # ====================================================
+            # -----------------------------------------
 
             with tab1:
 
                 st.code(
                     english_srt,
-                    language="text",
+                    language="text"
                 )
 
                 st.download_button(
-
                     "⬇️ Download English.srt",
-
                     data=english_srt.encode(
                         "utf-8"
                     ),
-
                     file_name="English.srt",
-
                     mime="application/x-subrip",
-
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
-            # ====================================================
+            # -----------------------------------------
             # KURDISH
-            # ====================================================
+            # -----------------------------------------
 
             with tab2:
 
                 st.code(
                     kurdish_srt,
-                    language="text",
+                    language="text"
                 )
 
                 st.download_button(
-
                     "⬇️ Download Kurdish.srt",
-
                     data=kurdish_srt.encode(
                         "utf-8"
                     ),
-
                     file_name="Kurdish.srt",
-
                     mime="application/x-subrip",
-
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
         except Exception as e:
@@ -569,20 +536,19 @@ if uploaded:
                 f"❌ Processing failed: {e}"
             )
 
-            st.caption(
-                "If the error mentions the API key, "
-                "model, file size, or unsupported audio "
-                "format, send me the exact error."
+            st.info(
+                "If the error appears again, "
+                "send me the complete error message."
             )
 
 
-# ============================================================
+# =========================================================
 # FOOTER
-# ============================================================
+# =========================================================
 
 st.divider()
 
 st.caption(
-    "☁️ Cloud-only app — nothing needs to be installed "
-    "on your phone."
+    "☁️ Cloud-only app — "
+    "nothing needs to be installed on your phone."
 )
